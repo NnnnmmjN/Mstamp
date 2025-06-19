@@ -1,38 +1,37 @@
 #ifndef AUDIO_H_
-#define AUDIO_H
+#define AUDIO_H_
 #include "tracks.h"
 #include <miniaudio.h>
 
 typedef struct {
 	Tracks tracks;
 	ma_decoder decoder;
-} Music;
+} MusicCollection;
 
 ma_result audio_init();
-void audio_uninit();
+void audio_deinit();
 
 bool audio_unpause();
 bool audio_pause();
 void audio_restart();
 
-Music audio_load_tracks(Arena *a, const char *file_path);
-void audio_unload_tracks(Music *music);
-void audio_select_track(Music *music, size_t index);
+MusicCollection audio_load_tracks(Arena *a, const char *music_path, const char *timestamp_path);
+void audio_unload_tracks(MusicCollection *music);
+void audio_select_track(MusicCollection *music, size_t index);
 
 #endif // AUDIO_H_
 
 #ifdef AUDIO_IMPLEMENTATION
+#undef AUDIO_IMPLEMENTATION
 #define TRACKS_IMPLEMENTATION
 #include "tracks.h"
 
-const char *timestamps_from_music_name(const char *music_file);
-const char *get_relative_path_to_music(const char *music_file);
 void play_callback(ma_device *pDevice, void *pOutput, const void *pInput, ma_uint32 frameCount);
 
 static ma_decoder_config decoder_config = {0};
 static ma_device device = {0};
 static Track *current_track = NULL;
-static Music *current_music = NULL;
+static MusicCollection *current_music = NULL;
 
 
 
@@ -68,32 +67,28 @@ ma_result audio_init() {
 
 	return result;
 defer:
-	audio_uninit();
+	audio_deinit();
 	return result;
 }
 #undef SAMPLE_FORMAT
 #undef SAMPLE_RATE
 #undef CHUNK_SIZE
 
-void audio_uninit() {
+void audio_deinit() {
 	ma_device_uninit(&device);
 }
 
-Music audio_load_tracks(Arena *a, const char *file_path) {
+MusicCollection audio_load_tracks(Arena *a, const char *music_path, const char *timestamp_path) {
 	ma_result result;
-	Music music = {0};
+	MusicCollection music = {0};
 
-	const char *timestamps_file = nob_temp_sprintf("%s" TIMESTAMPS_FOLDER "%s", get_relative_path_to_music(file_path), timestamps_from_music_name(file_path));
-    if (!tracks_read_from_file(a, timestamps_file, &music.tracks)) nob_return_defer(MA_INVALID_FILE);
-	music.tracks.music_file = file_path;
+    if (!tracks_read_from_file(a, timestamp_path, &music.tracks)) nob_return_defer(MA_INVALID_FILE);
 
+	result = ma_decoder_init_file(music_path, &decoder_config, &music.decoder);
+	check_ma_result("Failed to load music file `%s`", music_path);
 
-
-	result = ma_decoder_init_file(file_path, &decoder_config, &music.decoder);
-	check_ma_result("Failed to load music file `%s`", file_path);
-
-    nob_log(NOB_INFO, "Opened `%s`", file_path);
-	nob_log(NOB_INFO, "Opened `%s`", timestamps_file);
+    nob_log(NOB_INFO, "Opened `%s`", strrchr(music_path, '/'));
+	nob_log(NOB_INFO, "Opened `%s`", strrchr(timestamp_path, '/'));
 
 
 
@@ -108,12 +103,12 @@ defer:
 	return music;
 }
 
-void audio_unload_tracks(Music *music) {
+void audio_unload_tracks(MusicCollection *music) {
 	ma_decoder_uninit(&music->decoder);
 	nob_da_free(&music->tracks);
 }
 
-void audio_select_track(Music *music, size_t index) {
+void audio_select_track(MusicCollection *music, size_t index) {
 	ma_uint32 sample_rate;
 	ma_data_source_get_data_format(&music->decoder, NULL, NULL, &sample_rate, NULL, CHANNEL_COUNT);
 
@@ -171,5 +166,4 @@ void play_callback(ma_device *pDevice, void *pOutput, const void *pInput, ma_uin
 }
 
 // #undef check_ma_result
-#undef AUDIO_IMPLEMENTATION
 #endif // AUDIO_IMPLEMENTATION

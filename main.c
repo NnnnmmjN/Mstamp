@@ -21,6 +21,10 @@ static const char *map_music_to_timestamp[][2] = {
 };
 static const size_t map_music_to_timestamp_count = NOB_ARRAY_LEN(map_music_to_timestamp);
 
+static inline Nob_StringView get_last_in_path(Nob_StringView *path) {
+	return nob_sv_rchop_by_delim(path, '/');
+}
+
 const char *music_file_get_name(const char *music_file) {
 	const char *name = strrchr(music_file, '/');
 	if (!name++) name = music_file;
@@ -59,28 +63,30 @@ const char *get_relative_path_to_music(const char *music_file) {
 
 
 static inline void usage(const char *program) {
-	fprintf(stderr, "Usage: %s <input.mp3> [track_index]\n", program);
+	fprintf(stderr, "Usage: %s <input.mp3> [track_index=0]\n", program);
 }
 
 int main(int argc, char *argv[]) {
 	int result = 0;
     size_t index = 0;
 
-	const char *program = nob_shift_args(&argc, &argv);
+	Nob_StringView program_path = nob_sv_from_cstr(nob_shift_args(&argc, &argv));
+	Nob_StringView program = get_last_in_path(&program_path);
 	if (argc <= 0) {
 		nob_log(NOB_ERROR, "Missing input file");
-		usage(program);
+		usage(program.items);
 		return 1;
 	}
 	const char *music_file = nob_shift_args(&argc, &argv);
     if (argc > 0) index = atoi(nob_shift_args(&argc, &argv));
+	const char *timestamp_file = nob_temp_sprintf("%s" TIMESTAMPS_FOLDER "%s", get_relative_path_to_music(music_file), timestamps_from_music_name(music_file));
 
 
 
 	if (audio_init() != MA_SUCCESS) nob_return_defer(2);
 
     Arena a = {0};
-	Music music = audio_load_tracks(&a, music_file);
+	MusicCollection music = audio_load_tracks(&a, music_file, timestamp_file);
 
     // for (size_t i = 0UL; i < tracks.count; i++) {		// list tracks and their indices
     //     Track *t = track_get(tracks, i);
@@ -94,7 +100,7 @@ int main(int argc, char *argv[]) {
 
 	audio_unload_tracks(&music);
 defer:
-	audio_uninit();
+	audio_deinit();
     arena_free(&a);
 	return result;
 }

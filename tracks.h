@@ -14,7 +14,6 @@ typedef struct {
 	Track *items;
 	size_t count;
 	size_t capacity;
-	const char *music_file;
 } Tracks;
 
 static inline Track *track_get(Tracks tracks, size_t i);
@@ -32,6 +31,7 @@ static inline bool tracks_set_end_time(Tracks tracks, uint32_t seconds);
 #endif // TRACKS_H_
 
 #ifdef TRACKS_IMPLEMENTATION
+#undef TRACKS_IMPLEMENTATION
 
 static inline void moddiv(unsigned a, unsigned b, unsigned *mod, unsigned *div) {
 	*div = a / b;
@@ -130,5 +130,4 @@ static inline bool tracks_set_end_time(Tracks tracks, uint32_t seconds) {
 	return false;
 }
 
-#undef TRACKS_IMPLEMENTATION
 #endif // TRACKS_IMPLEMENTATION
