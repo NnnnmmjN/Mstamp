@@ -1,0 +1,384 @@
+// Copyright 2022 Alexey Kutepov <reximkut@gmail.com>
+
+// before including:
+//      #define ARENA_IMPLEMENTATION
+
+// Permission is hereby granted, free of charge, to any person obtaining
+// a copy of this software and associated documentation files (the
+// "Software"), to deal in the Software without restriction, including
+// without limitation the rights to use, copy, modify, merge, publish,
+// distribute, sublicense, and/or sell copies of the Software, and to
+// permit persons to whom the Software is furnished to do so, subject to
+// the following conditions:
+
+// The above copyright notice and this permission notice shall be
+// included in all copies or substantial portions of the Software.
+
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+// EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+// MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+// NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
+// LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+// OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+// WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+#ifndef ARENA_H_
+#define ARENA_H_
+
+#include <stddef.h>
+#include <stdint.h>
+
+#ifndef ARENA_NOSTDIO
+#include <stdio.h>
+#include <stdarg.h>
+#endif // ARENA_NOSTDIO
+
+#ifndef ARENA_ASSERT
+#include <assert.h>
+#define ARENA_ASSERT assert
+#endif
+
+#define ARENA_BACKEND_LIBC_MALLOC 0
+#define ARENA_BACKEND_LINUX_MMAP 1
+#define ARENA_BACKEND_WIN32_VIRTUALALLOC 2
+#define ARENA_BACKEND_WASM_HEAPBASE 3
+
+#ifndef ARENA_BACKEND
+#define ARENA_BACKEND ARENA_BACKEND_LIBC_MALLOC
+#endif // ARENA_BACKEND
+
+typedef struct ArenaRegion ArenaRegion;
+
+struct ArenaRegion {
+    ArenaRegion *next;      // next Region in linked list
+    size_t count;           // current # of uintptr_t-sized blocks
+    size_t capacity;        // max # of uintptr_t-sized blocks
+    uintptr_t data[];       // flexible array (adjusted with malloc)
+};
+
+typedef struct {
+    ArenaRegion *begin, *end;
+} Arena;
+
+typedef struct {
+    ArenaRegion *region;
+    size_t count;
+} ArenaMark;
+
+#ifndef REGION_DEFAULT_CAPACITY
+#define REGION_DEFAULT_CAPACITY (8*1024)
+#endif // REGION_DEFAULT_CAPACITY
+
+ArenaRegion *new_region(size_t capacity);
+void free_region(ArenaRegion *r);
+
+void *arena_alloc(Arena *a, size_t size_bytes);
+void *arena_realloc(Arena *a, void *oldptr, size_t oldsz, size_t newsz);
+size_t arena_strlen(const char *s);
+void *arena_memcpy(void *dst, const void *src, size_t n);
+char *arena_strdup(Arena *a, const char *str);
+void *arena_memdup(Arena *a, void *data, size_t size);
+#ifndef ARENA_NOSTDIO
+char *arena_sprintf(Arena *a, const char *format, ...);
+#endif // ARENA_NOSTDIO
+
+ArenaMark arena_snapshot(Arena *a);
+void arena_reset(Arena *a);
+void arena_rewind(Arena *a, ArenaMark m);
+void arena_free(Arena *a);
+void arena_trim(Arena *a);
+
+#ifndef __cplusplus
+ #ifndef decltype
+  #define decltype(...) void *
+ #endif
+#endif
+
+#ifndef ARENA_DA_INIT_CAP
+#define ARENA_DA_INIT_CAP 256
+#endif // ARENA_DA_INIT_CAP
+
+#define arena_da_append(a, da, item)                                            \
+	do {																		\
+		if ((da)->count >= (da)->capacity) {									\
+            size_t new_capacity = (da)->capacity == 0 ?                         \
+                                    ARENA_DA_INIT_CAP : (da)->capacity * 2;     \
+			(da)->items = (decltype((da)->items)) arena_realloc((a),            \
+                    (da)->items,                                                \
+                    (da)->capacity * sizeof(*(da)->items),                      \
+                    new_capacity * sizeof(*(da)->items));                       \
+			(da)->capacity = new_capacity;                                      \
+		}																        \
+																		        \
+		(da)->items[(da)->count++] = (item);							        \
+	} while (0)
+
+#define arena_da_append_many(a, da, new_items, new_items_count)                                       \
+    do {                                                                                              \
+        if ((da)->count + (new_items_count) > (da)->capacity) {                                       \
+            size_t new_capacity = (da)->capacity;                                                     \
+            if (new_capacity == 0) new_capacity = ARENA_DA_INIT_CAP;                                  \
+            while ((da)->count + (new_items_count) > new_capacity) new_capacity *= 2;                 \
+            (da)->items = (decltype((da)->items)) arena_realloc(                                      \
+                (a), (da)->items,                                                                     \
+                (da)->capacity*sizeof(*(da)->items),                                                  \
+                new_capacity*sizeof(*(da)->items));                                                   \
+            (da)->capacity = new_capacity;                                                            \
+        }                                                                                             \
+        arena_memcpy((da)->items + (da)->count, (new_items), (new_items_count)*sizeof(*(da)->items)); \
+        (da)->count += (new_items_count);                                                             \
+    } while (0)
+
+#define arena_sb_append_buf arena_da_append_many
+
+// Append a NULL-terminated string to a string builder
+#define arena_sb_append_cstr(a, sb, cstr)  \
+    do {                                   \
+        const char *s = (cstr);            \
+        size_t n = arena_strlen(s);        \
+        arena_da_append_many(a, sb, s, n); \
+    } while (0)
+
+// Append a single NULL character at the end of a string builder. So then you can
+// use it a NULL-terminated C string
+#define arena_sb_append_null(a, sb) arena_da_append(a, sb, 0)
+
+#endif // ARENA_H_
+
+#ifdef ARENA_IMPLEMENTATION
+#undef ARENA_IMPLEMENTATION
+
+#if ARENA_BACKEND == ARENA_BACKEND_LIBC_MALLOC
+#include <stdlib.h>
+
+// TODO: instead of accepting specific capacity new_region() should accept the size of the object we want to fit into the region
+// It should be up to new_region() to decide the actual capacity to allocate
+ArenaRegion *new_region(size_t capacity) {
+    size_t size_bytes = sizeof(ArenaRegion) + sizeof(uintptr_t) * capacity;
+    // TODO: it would be nice if we could guarantee that the regions allocated by ARENA_BACKEND_LIBC_MALLOC are page aligned
+    ArenaRegion *r = (ArenaRegion *) malloc(size_bytes);
+    ARENA_ASSERT(r);
+    r->next = NULL;
+    r->count = 0;
+    r->capacity = capacity;
+    return r;
+}
+
+void free_region(ArenaRegion *r) {
+    free(r);
+}
+#elif ARENA_BACKEND == ARENA_BACKEND_LINUX_MMAP
+#include <unistd.h>
+#include <sys/mman.h>
+
+ArenaRegion *new_region(size_t capacity) {
+    size_t size_bytes = sizeof(ArenaRegion) + sizeof(uintptr_t) * capacity;
+    ArenaRegion *r = mmap(NULL, size_bytes, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+    ARENA_ASSERT(r != MAP_FAILED);
+    r->next = NULL;
+    r->count = 0;
+    r->capacity = capacity;
+    return r;
+}
+
+void free_region(ArenaRegion *r) {
+    size_t size_bytes = sizeof(ArenaRegion) + sizeof(uintptr_t) * r->capacity;
+    int ret = munmap(r, size_bytes);
+    ARENA_ASSERT(ret == 0);
+}
+
+
+#elif ARENA_BACKEND == ARENA_BACKEND_WIN32_VIRTUALALLOC
+
+#if !defined(_WIN32)
+#  error "Current platform is not Windows"
+#endif
+
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+
+#define INV_HANDLE(x)       (((x) == NULL) || ((x) == INVALID_HANDLE_VALUE))
+
+ArenaRegion *new_region(size_t capacity) {
+    SIZE_T size_bytes = sizeof(ArenaRegion) + sizeof(uintptr_t) * capacity;
+    ArenaRegion *r = VirtualAllocEx(
+        GetCurrentProcess(),      /* Allocate in current process address space */
+        NULL,                     /* Unknown position */
+        size_bytes,               /* Bytes to allocate */
+        MEM_COMMIT | MEM_RESERVE, /* Reserve and commit allocated page */
+        PAGE_READWRITE            /* Permissions ( Read/Write )*/
+    );
+    if (INV_HANDLE(r))
+        ARENA_ASSERT(0 && "VirtualAllocEx() failed.");
+
+    r->next = NULL;
+    r->count = 0;
+    r->capacity = capacity;
+    return r;
+}
+
+void free_region(ArenaRegion *r) {
+    if (INV_HANDLE(r))
+        return;
+
+    BOOL free_result = VirtualFreeEx(
+        GetCurrentProcess(),        /* Deallocate from current process address space */
+        (LPVOID)r,                  /* Address to deallocate */
+        0,                          /* Bytes to deallocate ( Unknown, deallocate entire page ) */
+        MEM_RELEASE                 /* Release the page ( And implicitly decommit it ) */
+    );
+
+    if (FALSE == free_result)
+        ARENA_ASSERT(0 && "VirtualFreeEx() failed.");
+}
+
+#elif ARENA_BACKEND == ARENA_BACKEND_WASM_HEAPBASE
+#  error "TODO: WASM __heap_base backend is not implemented yet"
+#else
+#  error "Unknown Arena backend"
+#endif
+
+// TODO: add debug statistic collection mode for arena
+// Should collect things like:
+// - How many times new_region was called
+// - How many times existing region was skipped
+// - How many times allocation exceeded REGION_DEFAULT_CAPACITY
+
+void *arena_alloc(Arena *a, size_t size_bytes) {
+    size_t size = (size_bytes + sizeof(uintptr_t) - 1)/sizeof(uintptr_t);
+
+    if (a->end == NULL) {
+        ARENA_ASSERT(a->begin == NULL);
+        size_t capacity = REGION_DEFAULT_CAPACITY;
+        if (capacity < size) capacity = size;
+        a->end = new_region(capacity);
+        a->begin = a->end;
+    }
+
+    while (a->end->count + size > a->end->capacity && a->end->next != NULL) {
+        a->end = a->end->next;
+    }
+
+    if (a->end->count + size > a->end->capacity) {
+        ARENA_ASSERT(a->end->next == NULL);
+        size_t capacity = REGION_DEFAULT_CAPACITY;
+        if (capacity < size) capacity = size;
+        a->end->next = new_region(capacity);
+        a->end = a->end->next;
+    }
+
+    void *result = &a->end->data[a->end->count];
+    a->end->count += size;
+    return result;
+}
+
+// void *arena_realloc(Arena *a, void *oldptr, size_t oldsz, size_t newsz) {
+//     if (newsz <= oldsz) return oldptr;
+//     void *newptr = arena_alloc(a, newsz);
+//     char *newptr_char = (char *) newptr;
+//     char *oldptr_char = (char *) oldptr;
+//     for (size_t i = 0; i < oldsz; ++i) {
+//         newptr_char[i] = oldptr_char[i];
+//     }
+//     return newptr;
+// }
+
+ArenaMark arena_snapshot(Arena *a) {
+    ArenaMark m;
+    if (a->end == NULL) {   // snapshot of uninitialized arena
+        ARENA_ASSERT(a->begin == NULL);
+        m.region = a->end;
+        m.count = 0UL;
+    } else {
+        m.region = a->end;
+        m.count = a->end->count;
+    }
+
+    return m;
+}
+
+void arena_reset(Arena *a) {
+    for (ArenaRegion *r = a->begin; r != NULL; r = r->next) r->count = 0;
+    a->end = a->begin;
+}
+
+void arena_rewind(Arena *a, ArenaMark m) {
+    if (m.region == NULL) { // snapshot of uninitialized arena
+        arena_reset(a);
+        return;
+    }
+
+    m.region->count = m.count;
+    for (ArenaRegion *r = m.region->next; r; r = r->next) r->count = 0UL;
+
+    a->end = m.region;
+}
+
+void arena_free(Arena *a) {
+    ArenaRegion *r = a->begin;
+    while (r) {
+        ArenaRegion *r0 = r;
+        r = r->next;
+        free_region(r0);
+    }
+    a->begin = NULL;
+    a->end = NULL;
+}
+
+void arena_trim(Arena *a) {
+    ArenaRegion *r = a->end->next;
+    while (r) {
+        ArenaRegion *r0 = r;
+        r = r->next;
+        free_region(r0);
+    }
+    a->end->next = NULL;
+}
+
+
+
+size_t arena_strlen(const char *s) {
+    size_t n = 0UL;
+    while (*s++) n++;
+    return n;
+}
+
+void *arena_memcpy(void *dst, const void *src, size_t n) {
+    char *d = dst;
+    const char *s = src;
+    for (; n; n--) *d++ = *s++;
+    return dst;
+}
+
+char *arena_strdup(Arena *a, const char *str) {
+    int n = strlen(str);
+    char *result = (char *) arena_alloc(a, n + 1);
+    arena_memcpy(result, str, n);
+    result[n] = '\0';
+
+    return result;
+}
+
+void *arena_memdup(Arena *a, void *data, size_t size) {
+    return arena_memcpy(arena_alloc(a, size), data, size);
+}
+
+#ifndef ARENA_NOSTDIO
+char *arena_sprintf(Arena *a, const char *format, ...) {
+	va_list args;
+	va_start(args, format);
+	int n = vsnprintf(NULL, 0, format, args);
+	va_end(args);
+
+	ARENA_ASSERT(n >= 0);
+	char *result = (char *) arena_alloc(a, n + 1);
+	ARENA_ASSERT(result != NULL && "Extend the size of temporary allocator");
+	va_start(args, format);
+	vsnprintf(result, n + 1, format, args);
+	va_end(args);
+
+	return result;
+}
+#endif // ARENA_NOSTDIO
+
+#endif // ARENA_IMPLEMENTATION
